@@ -1,5 +1,29 @@
 # lorri
 
+## Kovari Rust maintenance fork
+
+This fork is maintained at [Kovari-Industries/lorri](https://github.com/Kovari-Industries/lorri).
+The default branch, `kovari-rust`, starts from upstream Rust release **1.7.1**
+(commit `9f6ba63b41bbe984b3394678f31ebdd87559187b`), not the Go rewrite.
+
+The watcher uses parent-directory notifications for files so that atomic saves
+such as `sed -i` do not lose a replacement event during debouncing. Exact-path
+filtering still excludes unrelated sibling files. The Linux regression covers
+fast atomic replacements, repeated saves, and subsequent in-place edits:
+
+```sh
+cargo test --locked --lib watch::tests
+```
+
+Use the development environment described in [CONTRIBUTING.md](CONTRIBUTING.md)
+for the build-time environment variables. This fork retains upstream direnv
+integration and failure behavior: a failed update can leave the previous cached
+environment loaded without a warning. This patch does not qualify automatic
+shell setup or change flake dependency tracking. macOS behavior is not qualified
+by the Linux regression.
+
+## Upstream project
+
 Announcement: The IRC channel has moved to libera.chat, `#lorri`.
 We have been devoiced and de-oped by the freenode admins because of advertising this fact.
 If you still idle in `#lorri` on freenode, please come join us there.

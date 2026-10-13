@@ -294,10 +294,16 @@ impl Filter {
                     if !this.current_watched.contains(&p) {
                         debug!(this.logger, "watching path"; "path" => p.to_str());
 
-                        this.filesystem_watcher
-                            .watcher()
-                            .watch(&p, RecursiveMode::NonRecursive)?;
-                        this.current_watched.insert(p.clone());
+                        // Watch files through their parent directory, not their inode.
+                        // On Linux, replacing a directly watched file also emits a
+                        // removal for the old inode at the same path. If the temp
+                        // file was created in this debounce window, that removal
+                        // can cancel the replacement's creation event entirely.
+                        if p.is_dir() {
+                            this.filesystem_watcher
+                                .watcher()
+                                .watch(&p, RecursiveMode::NonRecursive)?;
+                        }
                     }
 
                     if let Some(parent) = p.parent() {
@@ -309,6 +315,7 @@ impl Filter {
                                 .watch(parent, RecursiveMode::NonRecursive)?;
                         }
                     }
+                    this.current_watched.insert(p);
                 }
             }
         }
@@ -683,6 +690,69 @@ mod tests {
             expect_bash(r#"mv "$1/bar" "$1/foo""#, [t]);
             assert_file_changed_within(&watcher, "foo", WATCHER_TIMEOUT);
         })
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn atomic_save_within_debounce_window() {
+        // Register synchronously so the test cannot race the watch-list channel.
+        let logger = crate::logging::test_logger("atomic_save_within_debounce_window");
+        let (_requests, requests_rx) = crossbeam_channel::unbounded();
+        let (events_tx, _events) = crossbeam_channel::unbounded();
+        let mut filter = super::Filter::new(requests_rx, events_tx, None, &logger).unwrap();
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("flake.nix");
+        let temporary = directory.path().join("flake.nix.tmp");
+        std::fs::write(&target, "initial").unwrap();
+        filter
+            .extend(vec![WatchPathBuf::Normal(target.clone())])
+            .unwrap();
+
+        let collect = |filter: &super::Filter| {
+            let deadline = time::Instant::now() + WATCHER_TIMEOUT;
+            let mut paths = Vec::new();
+            while let Some(remaining) = deadline.checked_duration_since(time::Instant::now()) {
+                match filter.filesystem_events_rx.recv_timeout(remaining) {
+                    Ok(events) => paths.extend(filter.process_watch_events(events.unwrap())),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                    Err(error) => panic!("watch channel closed: {}", error),
+                }
+            }
+            paths
+        };
+
+        for round in 0..2 {
+            // Unlike rename_over_vim, do not wait after creating the replacement.
+            // sed -i and editors create and rename it within one debounce window.
+            std::fs::write(&temporary, format!("replacement {}", round)).unwrap();
+            std::fs::rename(&temporary, &target).unwrap();
+            let paths = collect(&filter);
+            assert!(
+                paths.contains(&target),
+                "atomic save {} missed: {:?}",
+                round,
+                paths
+            );
+            assert!(
+                !paths.contains(&temporary),
+                "temporary file leaked: {:?}",
+                paths
+            );
+
+            std::fs::write(&target, format!("in-place {}", round)).unwrap();
+            let paths = collect(&filter);
+            assert!(
+                paths.contains(&target),
+                "watch lost after replacement: {:?}",
+                paths
+            );
+        }
+
+        std::fs::write(directory.path().join("unrelated"), "not an input").unwrap();
+        assert!(
+            collect(&filter).is_empty(),
+            "unrelated sibling triggered a rebuild"
+        );
     }
 
     #[test]
