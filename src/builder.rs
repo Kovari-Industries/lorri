@@ -597,6 +597,10 @@ fn extract_paths(results: impl IntoIterator<Item = LogDatum>) -> Vec<WatchPathBu
             }
             LogDatum::Text(_) | LogDatum::NonUtf(_) => None,
         })
+        // Nix reports virtual sources such as <nix/fetchurl.nix> and
+        // «nix-internal»/derivation-internal.nix alongside filesystem paths.
+        // They cannot be watched and would abort registration of real inputs.
+        .filter(|path| path.as_ref().is_absolute())
         .collect()
 }
 
@@ -818,6 +822,24 @@ mod tests {
                 "downloading 'https://static.rust-lang.org/dist/channel-rust-stable.toml'..."
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn virtual_sources_do_not_block_real_input_watches() {
+        let paths = extract_paths([
+            LogDatum::NixSourceFile("<nix/fetchurl.nix>".into()),
+            LogDatum::NixSourceFile("«nix-internal»/derivation-internal.nix".into()),
+            LogDatum::NixSourceFile("«flakes-internal»/call-flake.nix".into()),
+            LogDatum::NixSourceFile("/project/nix/shell.nix".into()),
+            LogDatum::ReadRecursively("/project/flake.lock".into()),
+        ]);
+        assert_eq!(
+            paths,
+            vec![
+                WatchPathBuf::Normal("/project/nix/shell.nix".into()),
+                WatchPathBuf::Recursive("/project/flake.lock".into()),
+            ]
         );
     }
 
