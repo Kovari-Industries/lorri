@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // Paths holds all the filesystem locations lorri uses.
@@ -38,6 +39,25 @@ func InitPaths() (*Paths, error) {
 	cacheDir, err := lorriCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine lorri cache directory: %w", err)
+	}
+
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return nil, err
+	}
+	// Resolve user-selected cache links, then secure the actual owned directory.
+	cacheDir, err = filepath.EvalSymlinks(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("unsafe Lorri cache directory: %s", cacheDir)
+	}
+	if err := os.Chmod(cacheDir, 0o700); err != nil {
+		return nil, err
 	}
 
 	gcRootDir := AbsPath(filepath.Join(cacheDir, "gc_roots"))
@@ -115,6 +135,12 @@ func writeFileIfChanged(path, content string, perm os.FileMode) error {
 // Respects XDG_CACHE_HOME if set (all platforms), otherwise falls back to
 // os.UserCacheDir() + "/lorri".
 func lorriCacheDir() (string, error) {
+	if directory := os.Getenv("LORRI_CACHE_DIR"); directory != "" {
+		if !filepath.IsAbs(directory) {
+			return "", fmt.Errorf("LORRI_CACHE_DIR must be absolute")
+		}
+		return directory, nil
+	}
 	var base string
 	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
 		base = xdg
@@ -137,6 +163,12 @@ func lorriCacheDir() (string, error) {
 // On Linux: $XDG_RUNTIME_DIR/lorri  (or cacheDir fallback if unset)
 // On other platforms: cacheDir
 func lorriRuntimeDir(cacheDir string) (string, error) {
+	if directory := os.Getenv("LORRI_RUNTIME_DIR"); directory != "" {
+		if !filepath.IsAbs(directory) {
+			return "", fmt.Errorf("LORRI_RUNTIME_DIR must be absolute")
+		}
+		return directory, nil
+	}
 	if runtime.GOOS == "linux" {
 		if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
 			return filepath.Join(xdg, "lorri"), nil

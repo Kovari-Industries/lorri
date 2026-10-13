@@ -12,8 +12,24 @@ and exclude virtual Nix source labels from filesystem watches. Exact-path
 filtering still excludes unrelated sibling writes. Focused regressions cover
 repeated fast atomic saves, later in-place edits, and virtual source labels.
 
-The upstream native shell hooks, `LORRI_PROJECT`, and flake package remain
-available. Consumers choose their shell integration separately.
+The native exporter also fixes reload baselines, inherited child-shell sessions,
+and exit from a cached project into an unbuilt project. Bash/Zsh hooks provide
+an explicit shell PID. Cache directories are private (`0700`); session databases
+are owned regular files (`0600`), with database symlinks rejected. Saved original
+environment values can contain secrets.
+
+`lorri watch --shell-file /checkout/shell.nix --env-file /state/runtime.json`
+registers one project and an optional declarative environment layer. The file uses
+the same version-1 `env.json` format as the Nix cache. It is read, not executed,
+at each prompt. A changed file reloads from the original baseline without a Nix
+rebuild. A missing file means no extra layer; malformed data fails loading.
+`lorri unwatch --shell-file /checkout/shell.nix` revokes only that exact project.
+Registered flakes retain their type for background rebuild requests.
+
+`LORRI_CACHE_DIR` and `LORRI_RUNTIME_DIR` select absolute Lorri-specific directories
+without replacing ambient `PATH` or XDG values. Integrations can check
+`lorri internal capabilities_` for `native-session-v2 env-file-v1`. The upstream
+direnv adapter remains available, but Evo uses only the native Bash/Zsh hooks.
 
 ## Overview
 

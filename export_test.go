@@ -126,6 +126,7 @@ func TestExportOutputBash(t *testing.T) {
 
 // shellTestCase describes a shell-specific test configuration.
 type shellTestCase struct {
+	extra []EnvChange
 	// name is the lorri shell name (passed to `lorri export <name>`).
 	name string
 	// bin is the shell binary name on PATH.
@@ -406,6 +407,11 @@ func skipIfNoShell(t *testing.T, bin string) {
 // runExportIntegration runs the full enter/leave integration test for one shell.
 func runExportIntegration(t *testing.T, tc shellTestCase) {
 	t.Helper()
+	runExportProject(t, tc, false)
+}
+
+func runExportProject(t *testing.T, tc shellTestCase, flake bool) {
+	t.Helper()
 	skipIfNoShell(t, tc.bin)
 
 	lorriBin := lorriBinForTest(t)
@@ -416,13 +422,13 @@ func runExportIntegration(t *testing.T, tc shellTestCase) {
 
 	// ── Build env.json ────────────────────────────────────────────────────
 	// The env.json lives directly in tmpDir; the GC root symlink will point here.
-	buildEnvJSON(t, tmpDir, []EnvChange{
+	buildEnvJSON(t, tmpDir, append([]EnvChange{
 		{Op: "set", Name: "MARKER", Value: "hello"},
 		{Op: "unset", Name: "UNSET_MARKER"},
 		{Op: "pass", Name: "PASS_MARKER", Value: "nix-set-value"},
 		{Op: "prepend", Name: "PKG_CONFIG_PATH", Value: "/nix/store/abc/lib/pkgconfig", Sep: ":"},
 		{Op: "append", Name: "GOPATH", Value: "/nix-gopath", Sep: ":"},
-	})
+	}, tc.extra...))
 
 	// ── Register project in DB ────────────────────────────────────────────
 	// The project dir contains shell.nix so findProjectForDir matches it.
@@ -431,6 +437,9 @@ func runExportIntegration(t *testing.T, tc shellTestCase) {
 		t.Fatalf("mkdir project: %v", err)
 	}
 	nixFile := filepath.Join(projectDir, "shell.nix")
+	if flake {
+		nixFile = filepath.Join(projectDir, "flake.nix")
+	}
 	// Write a minimal shell.nix (content doesn't matter; only path matters).
 	if err := os.WriteFile(nixFile, []byte("{}"), 0o644); err != nil {
 		t.Fatalf("write shell.nix: %v", err)
@@ -446,7 +455,7 @@ func runExportIntegration(t *testing.T, tc shellTestCase) {
 	if err != nil {
 		t.Fatalf("OpenLorriDB: %v", err)
 	}
-	if err := db.UpsertProject(nixFile, false, ""); err != nil {
+	if err := db.UpsertProject(nixFile, flake, ""); err != nil {
 		db.Close()
 		t.Fatalf("UpsertProject: %v", err)
 	}
@@ -459,6 +468,9 @@ func runExportIntegration(t *testing.T, tc shellTestCase) {
 		t.Fatalf("mkdir gc_roots: %v", err)
 	}
 	projectFile := NewShellNixProjectFile(mustAbsPath(nixFile))
+	if flake {
+		projectFile = NewFlakeProjectFile(mustAbsPath(projectDir), "")
+	}
 	gcRootLink := gcRootPathForProject(gcRootDir, projectFile).String()
 	if err := os.MkdirAll(filepath.Dir(gcRootLink), 0o755); err != nil {
 		t.Fatalf("mkdir gc root parent: %v", err)
@@ -539,4 +551,224 @@ func TestExportElvish(t *testing.T) {
 
 func TestExportTcsh(t *testing.T) {
 	runExportIntegration(t, shellTestCases[4])
+}
+
+func TestNativeRegisteredFlake(t *testing.T) {
+	tc := shellTestCases[0]
+	original := tc.script
+	tc.script = func(project, binary, home string) string {
+		return strings.ReplaceAll(original(project, binary, home), "$PROJECT_DIR/shell.nix", "$PROJECT_DIR/flake.nix")
+	}
+	runExportProject(t, tc, true)
+}
+
+func TestNativeReloadRestoresOriginalEnvironment(t *testing.T) {
+	tc := shellTestCases[0]
+	tc.script = func(project, binary, home string) string {
+		return fmt.Sprintf(`
+set -eu
+cd %q
+LORRI=%q
+eval "$("$LORRI" export bash)"
+printf '%%s' '{"version":1,"env":[{"op":"prepend","name":"PKG_CONFIG_PATH","value":"new","sep":":"}]}' > ../env.json
+eval "$("$LORRI" export bash)"
+[[ "$PKG_CONFIG_PATH" == new:ambient-pkgconfig ]]
+[[ -z ${MARKER+x} ]]
+cd /tmp
+eval "$("$LORRI" export bash)"
+[[ "$PKG_CONFIG_PATH" == ambient-pkgconfig ]]
+[[ "$UNSET_MARKER" == original-value ]]
+`, project, binary)
+	}
+	runExportIntegration(t, tc)
+}
+
+func TestNativeChildShellDoesNotConsumeParentSession(t *testing.T) {
+	tc := shellTestCases[0]
+	tc.script = func(project, binary, home string) string {
+		return fmt.Sprintf(`
+set -eu
+cd %q
+export LORRI=%q
+eval "$("$LORRI" export bash)"
+bash -ec 'cd /tmp; eval "$("$LORRI" export bash)"; [[ "$UNSET_MARKER" == original-value ]]'
+cd /tmp
+eval "$("$LORRI" export bash)"
+[[ "$UNSET_MARKER" == original-value ]]
+[[ -z ${MARKER+x} ]]
+`, project, binary)
+	}
+	runExportIntegration(t, tc)
+}
+
+func TestNativeEnvironmentFileReload(t *testing.T) {
+	for _, shell := range []string{"bash", "zsh"} {
+		t.Run(shell, func(t *testing.T) {
+			tc := shellTestCases[0]
+			tc.extra = []EnvChange{{Op: "prepend", Name: "PATH", Value: "/nix-tools/bin", Sep: ":"}}
+			tc.name, tc.bin = shell, shell
+			tc.script = func(project, binary, home string) string {
+				return fmt.Sprintf(`
+set -eu
+cd %q
+LORRI=%q
+export LORRI_SHELL_PID=$$
+original_path=$PATH
+"$LORRI" watch --shell-file "$PWD/shell.nix" --env-file "$PWD/runtime.json"
+eval "$("$LORRI" export %[3]s)"
+printf '%%s' '{"version":1,"env":[{"op":"prepend","name":"PATH","value":"/runtime/bin","sep":":"},{"op":"set","name":"RUNTIME_MARKER","value":"one"}]}' > runtime.json
+eval "$("$LORRI" export %[3]s)"
+[[ $PATH == "/runtime/bin:/nix-tools/bin:$original_path" && $RUNTIME_MARKER == one ]]
+printf '%%s' '{"version":1,"env":[{"op":"prepend","name":"PATH","value":"/new-runtime/bin","sep":":"}]}' > runtime.json
+eval "$("$LORRI" export %[3]s)"
+[[ $PATH == "/new-runtime/bin:/nix-tools/bin:$original_path" && -z ${RUNTIME_MARKER+x} ]]
+printf 'invalid JSON' > runtime.json
+if "$LORRI" export %[3]s > "$HOME/rejected-export" 2>/dev/null; then exit 1; fi
+[[ ! -s $HOME/rejected-export ]]
+rm runtime.json
+eval "$("$LORRI" export %[3]s)"
+[[ $PATH == "/nix-tools/bin:$original_path" ]]
+cd /tmp
+eval "$("$LORRI" export %[3]s)"
+[[ $PATH == "$original_path" && $UNSET_MARKER == original-value ]]
+`, project, binary, shell)
+			}
+			runExportIntegration(t, tc)
+		})
+	}
+}
+
+func TestNativeNamespaceDoesNotReplaceAmbient(t *testing.T) {
+	tc := shellTestCases[0]
+	tc.script = func(project, binary, home string) string {
+		return fmt.Sprintf(`
+set -eu
+cd %q
+LORRI=%q
+export LORRI_CACHE_DIR="$XDG_CACHE_HOME/lorri" LORRI_RUNTIME_DIR="$HOME/socket"
+export XDG_CACHE_HOME=/personal/cache XDG_RUNTIME_DIR=/personal/runtime
+original_path=$PATH
+eval "$("$LORRI" export bash)"
+[[ $XDG_CACHE_HOME == /personal/cache && $XDG_RUNTIME_DIR == /personal/runtime && $PATH == "$original_path" ]]
+cd /tmp
+eval "$("$LORRI" export bash)"
+[[ $UNSET_MARKER == original-value ]]
+`, project, binary)
+	}
+	runExportIntegration(t, tc)
+}
+
+func TestNativeUnbuiltProjectUnloadsPrevious(t *testing.T) {
+	tc := shellTestCases[0]
+	tc.script = func(project, binary, home string) string {
+		return fmt.Sprintf(`
+set -eu
+cd %q
+LORRI=%q
+eval "$("$LORRI" export bash)"
+mkdir "$HOME/unbuilt"
+printf '{}' > "$HOME/unbuilt/shell.nix"
+# No daemon is needed; registration occurs before the background ping.
+"$LORRI" watch --shell-file "$HOME/unbuilt/shell.nix" 2>/dev/null || :
+cd "$HOME/unbuilt"
+eval "$("$LORRI" export bash)"
+[[ -z ${MARKER+x} && -z ${LORRI_SESSION_ID+x} && $UNSET_MARKER == original-value ]]
+`, project, binary)
+	}
+	runExportIntegration(t, tc)
+}
+
+func TestNativeHooksNestedShells(t *testing.T) {
+	for _, shell := range []string{"bash", "zsh"} {
+		t.Run(shell, func(t *testing.T) {
+			tc := shellTestCases[0]
+			tc.name, tc.bin = shell, shell
+			tc.script = func(project, binary, home string) string {
+				return fmt.Sprintf(`
+set -eu
+export LORRI=%q NATIVE_SHELL=%q
+lorri() { "$LORRI" "$@"; }
+eval "$(lorri hook "$NATIVE_SHELL")"
+cd %q
+_lorri_hook
+export PARENT_SESSION=$LORRI_SESSION_ID
+"$NATIVE_SHELL" -c '
+set -eu
+lorri() { "$LORRI" "$@"; }
+eval "$(lorri hook "$NATIVE_SHELL")"
+_lorri_hook
+[[ $LORRI_SESSION_ID != "$PARENT_SESSION" ]]
+[[ $PKG_CONFIG_PATH == /nix/store/abc/lib/pkgconfig:ambient-pkgconfig ]]
+cd /tmp
+_lorri_hook
+[[ $UNSET_MARKER == original-value && -z ${MARKER+x} ]]
+'
+[[ $LORRI_SESSION_ID == "$PARENT_SESSION" && $MARKER == hello ]]
+cd /tmp
+_lorri_hook
+[[ $UNSET_MARKER == original-value && $PKG_CONFIG_PATH == ambient-pkgconfig ]]
+`, binary, shell, project)
+			}
+			runExportIntegration(t, tc)
+		})
+	}
+}
+
+func TestNativeSessionDatabaseIsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.sqlite")
+	// Existing databases must also be secured before storing baseline values.
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenLorriDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("saved shell state permissions: %o", info.Mode().Perm())
+	}
+}
+
+func TestNativeCachePrivateAndDatabaseSymlinkRejected(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "cache")
+	if err := os.Mkdir(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LORRI_CACHE_DIR", cache)
+	t.Setenv("LORRI_RUNTIME_DIR", filepath.Join(root, "socket"))
+	paths, err := InitPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("cache permissions: %o", info.Mode().Perm())
+	}
+	other := filepath.Join(root, "unrelated")
+	if err := os.WriteFile(other, []byte("untouched"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, paths.SQLiteDB.String()); err != nil {
+		t.Fatal(err)
+	}
+	if db, err := OpenLorriDB(paths.SQLiteDB.String()); err == nil {
+		db.Close()
+		t.Fatal("accepted database symlink")
+	}
+	data, err := os.ReadFile(other)
+	if err != nil || string(data) != "untouched" {
+		t.Fatal("changed unrelated symlink target")
+	}
 }

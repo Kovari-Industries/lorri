@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"zombiezen.com/go/sqlite"
@@ -23,6 +24,10 @@ CREATE TABLE IF NOT EXISTS gc_roots (
     last_updated EPOCH_TIME,
     is_flake BOOLEAN NOT NULL DEFAULT FALSE,
     flake_installable TEXT DEFAULT NULL
+);
+CREATE TABLE IF NOT EXISTS project_env_files (
+    nix_file TEXT PRIMARY KEY NOT NULL,
+    env_file TEXT NOT NULL
 );
 `
 
@@ -67,6 +72,23 @@ type LorriDB struct {
 // OpenLorriDB opens (or creates) the SQLite database at path and ensures
 // the schema exists.
 func OpenLorriDB(path string) (*LorriDB, error) {
+	// Baselines can contain secrets. Secure the file before SQLite writes any
+	// state, and never follow a database symlink or modify another user's file.
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("unsafe Lorri database: %s", path)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, err
+	}
 	conn, err := sqlite.OpenConn(path)
 	if err != nil {
 		return nil, fmt.Errorf("OpenLorriDB: open %s: %w", path, err)
@@ -110,7 +132,7 @@ func (db *LorriDB) FindRegisteredProjectForDir(dir string) (*DBProject, error) {
 		err := sqlitex.Execute(db.conn,
 			`SELECT nix_file, is_flake, flake_installable FROM gc_roots
 			 WHERE :path || '/' = rtrim(nix_file, replace(nix_file, '/', ''))
-			 LIMIT 1`,
+			 ORDER BY CASE WHEN nix_file = :path || '/shell.nix' THEN 0 ELSE 1 END, is_flake, nix_file LIMIT 1`,
 			&sqlitex.ExecOptions{
 				Named: map[string]any{":path": d},
 				ResultFunc: func(stmt *sqlite.Stmt) error {
@@ -165,7 +187,13 @@ func (db *LorriDB) UpsertProject(nixFile string, isFlake bool, flakeInstallable 
 }
 
 // DeleteProject removes a project row by nix_file path.
-func (db *LorriDB) DeleteProject(nixFile string) error {
+func (db *LorriDB) DeleteProject(nixFile string) (retErr error) {
+	end := sqlitex.Save(db.conn)
+	defer end(&retErr)
+	if err := sqlitex.Execute(db.conn, `DELETE FROM project_env_files WHERE nix_file=:file`,
+		&sqlitex.ExecOptions{Named: map[string]any{":file": nixFile}}); err != nil {
+		return err
+	}
 	return sqlitex.Execute(db.conn,
 		`DELETE FROM gc_roots WHERE nix_file = :nix_file`,
 		&sqlitex.ExecOptions{
@@ -281,7 +309,7 @@ func (db *LorriDB) SaveSessionAndEnvPrev(sessionID, project, envHash string, pre
 	endTx := sqlitex.Save(db.conn)
 	defer endTx(&retErr)
 
-	shellPID := os.Getppid()
+	shellPID := nativeShellPID()
 	if err := db.CreateShellSession(ShellSession{
 		SessionID: sessionID,
 		ShellPID:  shellPID,
@@ -428,4 +456,28 @@ func (db *LorriDB) AutoGCRemovedProjects() error {
 		}
 	}
 	return nil
+}
+
+// ProjectFile preserves the database's project type for daemon requests.
+func (p DBProject) ProjectFile() ProjectFile {
+	if p.IsFlake {
+		return NewFlakeProjectFile(mustAbsPath(filepath.Dir(p.NixFile)), p.FlakeInstallable)
+	}
+	return NewShellNixProjectFile(mustAbsPath(p.NixFile))
+}
+
+func (db *LorriDB) SetProjectEnvFile(project, file string) error {
+	return sqlitex.Execute(db.conn, `INSERT INTO project_env_files VALUES (:project, :file)
+        ON CONFLICT(nix_file) DO UPDATE SET env_file=excluded.env_file`,
+		&sqlitex.ExecOptions{Named: map[string]any{":project": project, ":file": file}})
+}
+
+func (db *LorriDB) ProjectEnvFile(project string) (string, error) {
+	var file string
+	err := sqlitex.Execute(db.conn, `SELECT env_file FROM project_env_files WHERE nix_file=:project`,
+		&sqlitex.ExecOptions{Named: map[string]any{":project": project}, ResultFunc: func(s *sqlite.Stmt) error {
+			file = s.ColumnText(0)
+			return nil
+		}})
+	return file, err
 }

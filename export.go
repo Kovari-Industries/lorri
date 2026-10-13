@@ -22,11 +22,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"time"
 
 	direnv "github.com/nix-community/lorri/direnv_vendor"
 )
@@ -42,124 +43,203 @@ func opExport(shellName string) error {
 	if shellName == "direnv-adapter" {
 		return opExportDirenvAdapter()
 	}
-
 	sh, ok := direnv.Shells[shellName]
 	if !ok {
 		return exitUserError(fmt.Sprintf("export: unsupported shell %q", shellName), nil)
 	}
-
 	paths, err := mustInitPaths()
 	if err != nil {
 		return err
 	}
-
 	db, err := OpenLorriDB(paths.SQLiteDB.String())
 	if err != nil {
-		return fmt.Errorf("export: open db: %w", err)
+		return err
 	}
 	defer db.Close()
-
-	// Resolve or generate the session ID. A fresh ID is generated if no
-	// project is currently loaded (LORRI_SESSION_ID unset); if one is set
-	// it is reused so the revert state remains consistent across prompts.
-	sessionID := os.Getenv("LORRI_SESSION_ID")
-	if sessionID == "" {
-		id, err := newSessionID()
-		if err != nil {
-			return fmt.Errorf("export: generate session id: %w", err)
-		}
-		sessionID = id
-	}
-
-	currentProject := os.Getenv("LORRI_PROJECT")
-	currentHash := os.Getenv("LORRI_ENV_HASH")
 	cwd, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("export: getwd: %w", err)
+		return err
 	}
-
-	// Find lorri project for the current directory.
-	foundDBProject, err := db.FindRegisteredProjectForDir(cwd)
+	project, err := db.FindRegisteredProjectForDir(cwd)
 	if err != nil {
-		return fmt.Errorf("export: find project: %w", err)
-	}
-	foundProject := ""
-	if foundDBProject != nil {
-		foundProject = foundDBProject.NixFile
+		return err
 	}
 
-	export := make(direnv.ShellExport)
-
-	switch {
-	case foundProject == "" && currentProject == "":
-		// Not in a lorri project, never were. Nothing to do.
-
-	case foundProject == "" && currentProject != "":
-		// Left the project. Revert environment.
-		if err := revertEnv(db, sessionID, export); err != nil {
-			fmt.Fprintf(os.Stderr, "lorri: warning: %v\n", err)
-		}
-		export.Remove("LORRI_SESSION_ID")
-		export.Remove("LORRI_PROJECT")
-		export.Remove("LORRI_ENV_HASH")
-
-	case foundProject != "" && currentProject == "":
-		// Entered a new project.
-		envHash, err := applyProject(db, sessionID, foundProject, paths, export)
+	ambient := ambientEnv()
+	base := ambientEnv()
+	previous := make(map[string]*string)
+	id := os.Getenv("LORRI_SESSION_ID")
+	owned := false
+	if id != "" {
+		session, err := db.GetShellSession(id)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "lorri: has not completed an evaluation for this project yet")
-			_ = opPingWithRebuild(paths, NewShellNixProjectFile(mustAbsPath(foundProject)), RebuildAlways)
-			break
+			return err
 		}
-		export.Add("LORRI_SESSION_ID", sessionID)
-		export.Add("LORRI_PROJECT", foundProject)
-		export.Add("LORRI_ENV_HASH", envHash)
-
-	case foundProject == currentProject && foundProject != "":
-		// Same project — check if a new build has landed.
-		envHash, newHash, err := currentEnvHash(foundProject, paths)
+		if session == nil {
+			return fmt.Errorf("missing shell restoration state; open a fresh shell")
+		}
+		owned = session.ShellPID == nativeShellPID()
+		previous, err = db.GetEnvPrev(id)
 		if err != nil {
-			// GC root may not exist yet — daemon hasn't built it. Silently skip.
-			break
+			return err
 		}
-		if newHash == currentHash {
-			// No change.
-			break
+		for name, value := range previous {
+			if value == nil {
+				delete(base, name)
+			} else {
+				base[name] = *value
+			}
 		}
-		// New build landed: revert old env, apply new.
-		if err := revertEnv(db, sessionID, export); err != nil {
-			fmt.Fprintf(os.Stderr, "lorri: warning: %v\n", err)
-		}
-		if _, err := applyProjectFromHash(db, sessionID, foundProject, envHash, paths, export); err != nil {
-			fmt.Fprintln(os.Stderr, "lorri: has not completed an evaluation for this project yet")
-			_ = opPingWithRebuild(paths, NewShellNixProjectFile(mustAbsPath(foundProject)), RebuildAlways)
-			break
-		}
-		export.Add("LORRI_SESSION_ID", sessionID)
-		export.Add("LORRI_PROJECT", foundProject)
-		export.Add("LORRI_ENV_HASH", newHash)
-
-	case foundProject != currentProject:
-		// Switched from one lorri project to another.
-		if err := revertEnv(db, sessionID, export); err != nil {
-			fmt.Fprintf(os.Stderr, "lorri: warning: %v\n", err)
-		}
-		envHash, err := applyProject(db, sessionID, foundProject, paths, export)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "lorri: has not completed an evaluation for this project yet")
-			_ = opPingWithRebuild(paths, NewShellNixProjectFile(mustAbsPath(foundProject)), RebuildAlways)
-			break
-		}
-		export.Add("LORRI_SESSION_ID", sessionID)
-		export.Add("LORRI_PROJECT", foundProject)
-		export.Add("LORRI_ENV_HASH", envHash)
 	}
-
-	out, err := sh.Export(export)
+	output := make(direnv.ShellExport)
+	if project == nil {
+		if id == "" {
+			return nil
+		}
+		for name, value := range previous {
+			if value == nil {
+				output.Remove(name)
+			} else {
+				output.Add(name, *value)
+			}
+		}
+		if owned {
+			if err := db.DeleteShellSession(id); err != nil {
+				return err
+			}
+		}
+		output.Remove("LORRI_SESSION_ID")
+		output.Remove("LORRI_PROJECT")
+		output.Remove("LORRI_ENV_HASH")
+	} else {
+		envPath, err := gcRootEnvJSON(project.NixFile, paths)
+		if err != nil {
+			// Keep the old environment while the new one is prepared. Preserve
+			// the registered project type when requesting a background build.
+			_ = opPingWithRebuild(paths, project.ProjectFile(), RebuildOnlyIfNotYetWatching)
+			if id != "" && os.Getenv("LORRI_PROJECT") != project.NixFile {
+				for name, value := range previous {
+					if value == nil {
+						output.Remove(name)
+					} else {
+						output.Add(name, *value)
+					}
+				}
+				output.Remove("LORRI_SESSION_ID")
+				output.Remove("LORRI_PROJECT")
+				output.Remove("LORRI_ENV_HASH")
+				rendered, renderErr := sh.Export(output)
+				if renderErr != nil {
+					return renderErr
+				}
+				fmt.Print(rendered)
+				if owned {
+					if deleteErr := db.DeleteShellSession(id); deleteErr != nil {
+						return deleteErr
+					}
+				}
+			}
+			return fmt.Errorf("environment pending for %s: %w", project.NixFile, err)
+		}
+		environment, err := readEnvJSON(envPath)
+		if err != nil {
+			return err
+		}
+		extra, err := db.ProjectEnvFile(project.NixFile)
+		if err != nil {
+			return err
+		}
+		if extra != "" {
+			overlay, err := readEnvJSON(extra)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("project environment file: %w", err)
+			}
+			if err == nil {
+				if overlay.Version != 1 {
+					return fmt.Errorf("unsupported environment file version %d", overlay.Version)
+				}
+				environment.Env = append(environment.Env, overlay.Env...)
+			}
+		}
+		if environment.Version != 1 {
+			return fmt.Errorf("unsupported environment version %d", environment.Version)
+		}
+		data, err := json.Marshal(environment)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		hash := base64.RawURLEncoding.EncodeToString(sum[:])
+		if owned && project.NixFile == os.Getenv("LORRI_PROJECT") && hash == os.Getenv("LORRI_ENV_HASH") {
+			return nil
+		}
+		// Compose against the restored baseline, never the currently loaded
+		// environment. Include removed variables in the outgoing revert diff.
+		for name, value := range previous {
+			if value == nil {
+				output.Remove(name)
+			} else {
+				output.Add(name, *value)
+			}
+		}
+		prev := make(map[string]*string)
+		effective := make(map[string]string)
+		for name, value := range base {
+			effective[name] = value
+		}
+		for _, change := range environment.Env {
+			if change.Op == "pass" {
+				continue
+			}
+			if change.Name == "" || strings.ContainsAny(change.Name, "=\x00") || strings.HasPrefix(change.Name, "LORRI_") {
+				return fmt.Errorf("invalid environment variable %q", change.Name)
+			}
+			switch change.Op {
+			case "set", "unset", "prepend", "append":
+			default:
+				return fmt.Errorf("invalid environment operation %q", change.Op)
+			}
+			if _, exists := prev[change.Name]; !exists {
+				if value, exists := base[change.Name]; exists {
+					v := value
+					prev[change.Name] = &v
+				} else {
+					prev[change.Name] = nil
+				}
+			}
+			applyChange(change, effective, output)
+			if value := output[change.Name]; value == nil {
+				delete(effective, change.Name)
+			} else {
+				effective[change.Name] = *value
+			}
+		}
+		if !owned {
+			id, err = newSessionID()
+			if err != nil {
+				return err
+			}
+		}
+		if err := db.SaveSessionAndEnvPrev(id, project.NixFile, hash, prev); err != nil {
+			return err
+		}
+		output.Add("LORRI_SESSION_ID", id)
+		output.Add("LORRI_PROJECT", project.NixFile)
+		output.Add("LORRI_ENV_HASH", hash)
+		// Avoid printing unchanged variable values or credentials.
+		for name, value := range output {
+			if value != nil && ambient[name] == *value {
+				if _, ok := ambient[name]; ok {
+					delete(output, name)
+				}
+			}
+		}
+	}
+	rendered, err := sh.Export(output)
 	if err != nil {
-		return fmt.Errorf("export: render: %w", err)
+		return err
 	}
-	fmt.Print(out)
+	fmt.Print(rendered)
 	return nil
 }
 
@@ -175,8 +255,6 @@ func newSessionID() (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
-
-
 
 // gcRootEnvJSON returns the path to env.json for a given project's GC root.
 func gcRootEnvJSON(project string, paths *Paths) (string, error) {
@@ -201,118 +279,6 @@ func readEnvJSON(path string) (*LorriEnv, error) {
 		return nil, fmt.Errorf("parse env.json: %w", err)
 	}
 	return &env, nil
-}
-
-// hashEnvJSON returns a short hash of env.json contents for change detection.
-func hashEnvJSON(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return base64.RawURLEncoding.EncodeToString(sum[:8]), nil
-}
-
-// currentEnvHash returns the env.json path and its hash for a project.
-func currentEnvHash(project string, paths *Paths) (envJSONPath, hash string, err error) {
-	envJSONPath, err = gcRootEnvJSON(project, paths)
-	if err != nil {
-		return "", "", err
-	}
-	hash, err = hashEnvJSON(envJSONPath)
-	return envJSONPath, hash, err
-}
-
-// applyProject reads the current env.json for a project, saves revert state,
-// and populates export with the changes. Returns the env hash.
-func applyProject(db *LorriDB, sessionID, project string, paths *Paths, export direnv.ShellExport) (string, error) {
-	envJSONPath, hash, err := currentEnvHash(project, paths)
-	if err != nil {
-		return "", fmt.Errorf("project %s: %w", project, err)
-	}
-	_, err = applyProjectFromHash(db, sessionID, project, envJSONPath, paths, export)
-	return hash, err
-}
-
-func applyProjectFromHash(db *LorriDB, sessionID, project, envJSONPath string, paths *Paths, export direnv.ShellExport) (string, error) {
-	start := time.Now()
-	lorriEnv, err := readEnvJSON(envJSONPath)
-	if err != nil {
-		return "", err
-	}
-
-	hash, err := hashEnvJSON(envJSONPath)
-	if err != nil {
-		return "", err
-	}
-
-	// Snapshot the current values of every var we're about to touch.
-	// Skip "pass" vars — they are never modified on enter so there is nothing
-	// to restore on leave. Snapshotting them would cause revertEnv to emit
-	// set/unset commands for read-only shell variables (e.g. SHLVL, PWD in fish).
-	prev := make(map[string]*string)
-	for _, change := range lorriEnv.Env {
-		if change.Op == "pass" {
-			continue
-		}
-		cur, exists := os.LookupEnv(change.Name)
-		if exists {
-			v := cur
-			prev[change.Name] = &v
-		} else {
-			prev[change.Name] = nil
-		}
-	}
-
-	// Save session + revert state atomically.
-	if err := db.SaveSessionAndEnvPrev(sessionID, project, hash, prev); err != nil {
-		return "", fmt.Errorf("save revert state: %w", err)
-	}
-
-	// Compute the export diff: apply each change against the ambient env.
-	ambient := ambientEnv()
-	for _, change := range lorriEnv.Env {
-		applyChange(change, ambient, export)
-	}
-
-	printEnvSummary(lorriEnv, prev, time.Since(start))
-	return hash, nil
-}
-
-// revertEnv reads the saved revert state and populates export with the
-// rollback commands, then deletes the session from the DB.
-func revertEnv(db *LorriDB, sessionID string, export direnv.ShellExport) error {
-	session, err := db.GetShellSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("revert: get session (session_id=%s): %w", sessionID, err)
-	}
-
-	prev, err := db.GetEnvPrev(sessionID)
-	if err != nil {
-		return fmt.Errorf("revert: get prev state (session_id=%s): %w", sessionID, err)
-	}
-	if len(prev) == 0 {
-		// No state — may have been cleaned up already.
-		return fmt.Errorf("revert: no session state found (session_id=%s) — environment may not revert cleanly", sessionID)
-	}
-	for varName, prevValue := range prev {
-		if prevValue == nil {
-			export.Remove(varName)
-		} else {
-			export.Add(varName, *prevValue)
-		}
-	}
-	_ = db.DeleteShellSession(sessionID)
-	project := ""
-	if session != nil {
-		project = session.Project
-	}
-	if project != "" {
-		fmt.Fprintf(os.Stderr, "lorri: unloaded %s\n", project)
-	} else {
-		fmt.Fprintf(os.Stderr, "lorri: unloaded\n")
-	}
-	return nil
 }
 
 // ambientEnv returns the current environment as a map.
@@ -355,42 +321,12 @@ func applyChange(change EnvChange, ambient map[string]string, export direnv.Shel
 	}
 }
 
-// printEnvSummary prints a compact human-readable summary of what changed
-// to stderr, filtering out Nix build internals.
-func printEnvSummary(lorriEnv *LorriEnv, prev map[string]*string, elapsed time.Duration) {
-	var added, changed, removed []string
-	for _, change := range lorriEnv.Env {
-		if isNixInternal(change.Name) {
-			continue
-		}
-		switch change.Op {
-		case "unset":
-			if prev[change.Name] != nil {
-				removed = append(removed, change.Name)
-			}
-		case "set", "prepend", "append":
-			if prev[change.Name] == nil {
-				added = append(added, change.Name)
-			} else {
-				changed = append(changed, change.Name)
-			}
-		}
+// Native hooks provide $$ because a command substitution can add a process.
+func nativeShellPID() int {
+	if pid, err := strconv.Atoi(os.Getenv("LORRI_SHELL_PID")); err == nil && pid > 0 {
+		return pid
 	}
-	if len(added)+len(changed)+len(removed) == 0 {
-		fmt.Fprintf(os.Stderr, "lorri: loaded [%s]\n", elapsed.Round(time.Millisecond))
-		return
-	}
-	var parts []string
-	if len(added) > 0 {
-		parts = append(parts, "+"+strings.Join(added, " +"))
-	}
-	if len(changed) > 0 {
-		parts = append(parts, "~"+strings.Join(changed, " ~"))
-	}
-	if len(removed) > 0 {
-		parts = append(parts, "-"+strings.Join(removed, " -"))
-	}
-	fmt.Fprintf(os.Stderr, "lorri: loaded (%s) [%s]\n", strings.Join(parts, " "), elapsed.Round(time.Millisecond))
+	return os.Getppid()
 }
 
 // opExportDirenvAdapter implements `lorri export direnv-adapter`.

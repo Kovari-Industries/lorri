@@ -10,6 +10,7 @@ var Bash Shell = bash{}
 const bashHook = `
 _lorri_hook() {
   local previous_exit_status=$?;
+  export LORRI_SHELL_PID=$$
   vars="$("{{.SelfPath}}" export bash)";
   trap -- '' SIGINT;
   eval "$vars";

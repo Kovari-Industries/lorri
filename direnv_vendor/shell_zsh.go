@@ -8,6 +8,7 @@ var Zsh Shell = zsh{}
 
 const zshHook = `
 _lorri_hook() {
+  export LORRI_SHELL_PID=$$
   vars="$("{{.SelfPath}}" export zsh)"
   trap -- '' SIGINT
   eval "$vars"

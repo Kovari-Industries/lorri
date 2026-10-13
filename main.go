@@ -450,6 +450,9 @@ subcommands:
 		return exitUserError("no internal subcommand given", nil)
 	}
 	switch args[0] {
+	case "capabilities_":
+		fmt.Println("native-session-v2 env-file-v1")
+		return nil
 	case "ping_":
 		return runPing(args[1:])
 	case "stream-events_":
@@ -954,8 +957,6 @@ func streamLive(socketPath SocketPath, sig <-chan os.Signal) error {
 	}
 }
 
-
-
 // ---------------------------------------------------------------------------
 // watch / unwatch
 // ---------------------------------------------------------------------------
@@ -977,7 +978,7 @@ func opWatch(paths *Paths, projectFile ProjectFile) error {
 	}
 	if existing, err := db.FindRegisteredProjectForDir(cwd); err != nil {
 		return fmt.Errorf("watch: %w", err)
-	} else if existing != nil {
+	} else if existing != nil && existing.NixFile == nixFilePathForProject(projectFile) {
 		fmt.Fprintf(os.Stderr, "lorri: already watching %s\n", existing.NixFile)
 		if os.Getenv("LORRI_SHELL") == "" {
 			fmt.Fprintf(os.Stderr, "lorri: warning: no shell hook detected; run 'lorri hook --how' for shell setup instructions\n")
@@ -1056,38 +1057,73 @@ func opUnwatch(paths *Paths) error {
 }
 
 func runWatch(args []string) error {
-	if len(args) > 0 {
-		return exitUserError("lorri watch takes no arguments", nil)
+	fs := flag.NewFlagSet("lorri watch", flag.ContinueOnError)
+	shellFile := fs.String("shell-file", "", "explicit shell.nix project")
+	envFile := fs.String("env-file", "", "optional declarative env.json applied by the native hook")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return exitUserError("lorri watch: unexpected arguments", nil)
 	}
 	paths, err := mustInitPaths()
 	if err != nil {
 		return err
 	}
-	projectFile, err := mustResolveProjectFile("", ".", "")
+	project, err := mustResolveProjectFile(*shellFile, ".", "")
 	if err != nil {
-		fmt.Fprint(os.Stderr, `lorri: no shell.nix or flake.nix found in current directory
-lorri: to create one, run:
-lorri:   nix flake init                       (minimal flake)
-lorri:   nix flake init -t templates#devShell (with a devShell template)
-lorri: then run 'lorri watch' again
-`)
 		return err
 	}
-	return opWatch(paths, projectFile)
+	if *envFile != "" {
+		absolute, err := filepath.Abs(*envFile)
+		if err != nil {
+			return err
+		}
+		db, err := OpenLorriDB(paths.SQLiteDB.String())
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		if err := db.SetProjectEnvFile(nixFilePathForProject(project), absolute); err != nil {
+			return err
+		}
+	}
+	return opWatch(paths, project)
 }
 
 func runUnwatch(args []string) error {
-	if len(args) > 0 {
-		return exitUserError("lorri unwatch takes no arguments", nil)
+	fs := flag.NewFlagSet("lorri unwatch", flag.ContinueOnError)
+	shellFile := fs.String("shell-file", "", "unregister only this exact project")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return exitUserError("lorri unwatch: unexpected arguments", nil)
 	}
 	paths, err := mustInitPaths()
 	if err != nil {
 		return err
 	}
-	return opUnwatch(paths)
+	if *shellFile == "" {
+		return opUnwatch(paths)
+	}
+	path, err := filepath.Abs(*shellFile)
+	if err != nil {
+		return err
+	}
+	db, err := OpenLorriDB(paths.SQLiteDB.String())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	// Exact removal must not use ancestor lookup: an unregistered child must
+	// never revoke its parent's authorization.
+	root := gcRootPathForProject(paths.GCRootDir, NewShellNixProjectFile(mustAbsPath(path)))
+	if err := os.RemoveAll(root.Dir().Dir().String()); err != nil {
+		return err
+	}
+	return db.DeleteProject(path)
 }
-
-
 
 // ---------------------------------------------------------------------------
 // info
@@ -1524,8 +1560,6 @@ func opPrompt(includeLeadingSpace bool, paths *Paths) error {
 	}
 	return nil
 }
-
-
 
 // lorriVersion is set at build time via -ldflags "-X main.lorriVersion=<ver>".
 // Falls back to the module pseudo-version from the build info.
