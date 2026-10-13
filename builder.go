@@ -158,6 +158,11 @@ func parseEvaluationLine(line string) logDatum {
 // a path that should be watched. Returns (path, true) or (zero, false).
 // Mirrors the match arms in instrumented_instantiation.
 func logDatumToWatchPath(d logDatum) (WatchPathBuf, bool) {
+	// Nix also reports virtual sources such as <nix/fetchurl.nix> and
+	// «nix-internal»/derivation-internal.nix. They are not filesystem inputs.
+	if !filepath.IsAbs(d.path) {
+		return WatchPathBuf{}, false
+	}
 	switch d.kind {
 	case logCopiedSource, logReadRecursively:
 		return WatchPathBuf{Recursive: true, Path: d.path}, true

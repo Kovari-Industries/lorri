@@ -1,5 +1,22 @@
 # ℓ lorri
 
+## Kovari fork
+
+`main` uses the upstream Go implementation from `nix-community/lorri`'s
+`canon` branch at `5b4211adce95ad3ac4a165181889e865c23d577c`. The former Rust
+maintenance commits remain in the Git history.
+
+This fork carries two changes from that maintenance work: watch files through
+their parent directories so atomic replacement does not replace a watched inode,
+and exclude virtual Nix source labels from filesystem watches. Exact-path
+filtering still excludes unrelated sibling writes. Focused regressions cover
+repeated fast atomic saves, later in-place edits, and virtual source labels.
+
+The upstream native shell hooks, `LORRI_PROJECT`, and flake package remain
+available. Consumers choose their shell integration separately.
+
+## Overview
+
 lorri is a `nix-shell` replacement for project development. lorri monitors
 your `shell.nix` and `flake.nix` and rebuilds the development environment
 in the background, automatically applying changes on your next shell prompt.

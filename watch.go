@@ -117,30 +117,28 @@ func (f *watchFilter) addPaths(paths []WatchPathBuf) error {
 				continue
 			}
 
-			// Hold the lock for the entire check-then-register operation to
-			// avoid a TOCTOU race where two goroutines both observe a path as
-			// unwatched and both call watcher.Add.
-			// Mirrors Filter::extend in src/watch.rs.
+			info, err := os.Stat(canon)
+			if err != nil {
+				continue
+			}
+			// Register files through their parent, not the inode that an
+			// atomic save replaces. Keep exact file paths in the filter so
+			// unrelated sibling writes do not trigger rebuilds.
+			watchPath := canon
+			if !info.IsDir() {
+				watchPath = filepath.Dir(canon)
+			}
 			f.mu.Lock()
 			if _, ok := f.currentWatched[canon]; !ok {
-				if err := f.watcher.Add(canon); err == nil {
-					f.currentWatched[canon] = struct{}{}
+				if err := f.watcher.Add(watchPath); err != nil {
+					f.mu.Unlock()
+					return err
 				}
+				f.currentWatched[canon] = struct{}{}
 			}
-			// Also watch the parent directory so that rename-into-place
-			// (Vim-style atomic writes) fire an event on the parent dir.
-			// The parent is registered with the OS watcher but NOT added to
-			// currentWatched: rename events report the target file's full path
-			// (e.g. parent/shell.nix), which matches the file directly in
-			// currentWatched. Adding the parent to currentWatched would cause
-			// any sibling file written in the same directory (e.g. a cast
-			// recorder writing demo.cast next to shell.nix) to spuriously
-			// trigger rebuilds.
-			// Mirrors the Rust Filter::extend: parent is watched via
-			// filesystem_watcher but never inserted into current_watched.
-			if parent := filepath.Dir(canon); parent != canon {
-				// Ignore the error: if we can't watch the parent we still
-				// watch the file itself, which is sufficient for most cases.
+			// Retain parent notifications for directory replacement too.
+			// The parent is not itself an input unless explicitly requested.
+			if parent := filepath.Dir(canon); info.IsDir() && parent != canon {
 				_ = f.watcher.Add(parent)
 			}
 			f.mu.Unlock()

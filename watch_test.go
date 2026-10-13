@@ -248,6 +248,52 @@ func TestWatchRenameOverVim(t *testing.T) {
 	})
 }
 
+func TestWatchAtomicSaveWithinDebounce(t *testing.T) {
+	w := mkWatchForTest(t)
+	defer w.Close()
+
+	withTestDir(t, func(dir string) {
+		target := filepath.Join(dir, "shell.nix")
+		temporary := filepath.Join(dir, ".shell.nix.tmp")
+		writeFile(t, target, "initial")
+		if err := w.AddPaths([]WatchPathBuf{{Path: target}}); err != nil {
+			t.Fatal(err)
+		}
+		canonicalDir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		registered := w.filter.watcher.WatchList()
+		if len(registered) != 1 || registered[0] != canonicalDir {
+			t.Fatalf("file must be watched through its parent only: %v", registered)
+		}
+		time.Sleep(watcherSettle)
+
+		for round := 0; round < 3; round++ {
+			// No settle delay between creating and renaming the temporary file.
+			writeFile(t, temporary, "replacement")
+			if err := os.Rename(temporary, target); err != nil {
+				t.Fatal(err)
+			}
+			found, seen := waitForFile(t, w, "shell.nix", watcherTimeout)
+			if !found {
+				t.Fatalf("round %d: atomic save was lost: %v", round, seen)
+			}
+			for _, path := range seen {
+				if path != filepath.Join(canonicalDir, "shell.nix") {
+					t.Errorf("temporary or sibling path escaped the filter: %s", path)
+				}
+			}
+			writeFile(t, target, "in-place edit")
+			if found, seen := waitForFile(t, w, "shell.nix", watcherTimeout); !found {
+				t.Fatalf("round %d: watch was lost after replacement: %v", round, seen)
+			}
+		}
+		writeFile(t, filepath.Join(dir, "unrelated"), "not an input")
+		assertNoEvent(t, w, watchDebounce+100*time.Millisecond)
+	})
+}
+
 // TestWatchSiblingFileNoSpuriousEvent is a regression test for the spin-loop
 // bug: a file in the same directory as a watched file must not trigger events.
 //

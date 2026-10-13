@@ -12,6 +12,30 @@ func fixtureNix(name string) string {
 	return filepath.Join(lorriRoot(), "tests", name)
 }
 
+func TestVirtualSourcesDoNotBlockRealInputWatches(t *testing.T) {
+	dir := t.TempDir()
+	realInput := filepath.Join(dir, "flake.nix")
+	for _, path := range []string{
+		"<nix/fetchurl.nix>",
+		"«nix-internal»/derivation-internal.nix",
+		"«flakes-internal»/call-flake.nix",
+	} {
+		if watch, ok := logDatumToWatchPath(logDatum{kind: logNixSourceFile, path: path}); ok {
+			t.Errorf("virtual source became a watch: %+v", watch)
+		}
+	}
+	for _, kind := range []logDatumKind{logNixSourceFile, logCopiedSource, logReadRecursively, logReadDir} {
+		watch, ok := logDatumToWatchPath(logDatum{kind: kind, path: realInput})
+		if !ok || watch.Path != realInput {
+			t.Errorf("real source was lost: %+v, %v", watch, ok)
+		}
+	}
+	watch, ok := logDatumToWatchPath(logDatum{kind: logNixSourceFile, path: dir})
+	if !ok || watch.Path != filepath.Join(dir, "default.nix") {
+		t.Errorf("directory import must watch default.nix: %+v, %v", watch, ok)
+	}
+}
+
 func TestInstantiateAndBuild(t *testing.T) {
 	rtc := os.Getenv("RUN_TIME_CLOSURE")
 	if rtc == "" {
