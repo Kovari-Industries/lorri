@@ -28,8 +28,14 @@ Registered flakes retain their type for background rebuild requests.
 
 `LORRI_CACHE_DIR` and `LORRI_RUNTIME_DIR` select absolute Lorri-specific directories
 without replacing ambient `PATH` or XDG values. Integrations can check
-`lorri internal capabilities_` for `native-session-v2 env-file-v1`. The upstream
-direnv adapter remains available, but Evo uses only the native Bash/Zsh hooks.
+`lorri internal capabilities_` for
+`native-session-v2 env-file-v1 watch-resume-v1`. Repeated `lorri watch`
+registration ensures a daemon-side watcher exists without forcing an environment
+rebuild. This resumes watching after a daemon restart; first registration still
+builds the environment, and actual input changes still trigger rebuilds.
+`lorri internal ping_` remains an explicit forced rebuild request.
+The upstream direnv adapter remains available, but Evo uses only the native
+Bash/Zsh hooks.
 
 ## Overview
 

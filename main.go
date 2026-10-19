@@ -451,7 +451,7 @@ subcommands:
 	}
 	switch args[0] {
 	case "capabilities_":
-		fmt.Println("native-session-v2 env-file-v1")
+		fmt.Println("native-session-v2 env-file-v1 watch-resume-v1")
 		return nil
 	case "ping_":
 		return runPing(args[1:])
@@ -963,7 +963,7 @@ func streamLive(socketPath SocketPath, sig <-chan os.Signal) error {
 
 // opWatch registers a project in the lorri database and pings the daemon to
 // begin watching it. If a project in the current directory is already
-// registered it prints a message and returns without error.
+// registered it ensures the daemon is watching without forcing a rebuild.
 func opWatch(paths *Paths, projectFile ProjectFile) error {
 	db, err := OpenLorriDB(paths.SQLiteDB.String())
 	if err != nil {
@@ -979,6 +979,9 @@ func opWatch(paths *Paths, projectFile ProjectFile) error {
 	if existing, err := db.FindRegisteredProjectForDir(cwd); err != nil {
 		return fmt.Errorf("watch: %w", err)
 	} else if existing != nil && existing.NixFile == nixFilePathForProject(projectFile) {
+		if err := opPingWithRebuild(paths, projectFile, RebuildOnlyIfNotYetWatching); err != nil {
+			fmt.Fprintf(os.Stderr, "lorri: warning: daemon not running; start it with 'lorri daemon'\n")
+		}
 		fmt.Fprintf(os.Stderr, "lorri: already watching %s\n", existing.NixFile)
 		if os.Getenv("LORRI_SHELL") == "" {
 			fmt.Fprintf(os.Stderr, "lorri: warning: no shell hook detected; run 'lorri hook --how' for shell setup instructions\n")

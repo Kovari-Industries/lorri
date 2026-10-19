@@ -143,6 +143,123 @@ derivation {
 	t.Logf("snapshot has %d event(s)", len(rawSnap.Snapshot))
 }
 
+// TestDaemonWatchRebuildPolicy exercises the existing handler with real build
+// loops. Requires the same Nix environment as TestDaemonFullStack.
+func TestDaemonWatchRebuildPolicy(t *testing.T) {
+	rtc := os.Getenv("RUN_TIME_CLOSURE")
+	if rtc == "" {
+		t.Skip("RUN_TIME_CLOSURE not set — run from lorri nix-shell")
+	}
+	dir := t.TempDir()
+	shellNix := filepath.Join(dir, "shell.nix")
+	expression := []byte(`
+derivation {
+  name = "lorri-watch-policy-test";
+  builder = "/bin/sh";
+  args = [ "-c" "echo > $out" ];
+  system = builtins.currentSystem;
+  allowSubstitutes = false;
+  preferLocalBuild = true;
+}
+`)
+	if err := os.WriteFile(shellNix, expression, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths := &Paths{
+		GCRootDir:      mustAbsPath(filepath.Join(dir, "gc_roots")),
+		SQLiteDB:       mustAbsPath(filepath.Join(dir, "lorri.sqlite")),
+		LoggedEvalFile: writeLoggedEvalForTest(t, dir),
+	}
+	db, err := OpenLorriDB(paths.SQLiteDB.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	project := NewShellNixProjectFile(mustAbsPath(shellNix))
+	events := make(chan LoopHandlerEvent, 64)
+	lorriBin := lorriBinForTest(t)
+
+	startHandler := func() (chan<- IndicateActivity, func()) {
+		activity := make(chan IndicateActivity)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			NewDaemon(NixOptions{}).buildInstructionHandler(context.Background(), activity, events, db, paths, rtc, lorriBin)
+		}()
+		stopped := false
+		stop := func() {
+			if !stopped {
+				stopped = true
+				close(activity)
+				<-done
+			}
+		}
+		t.Cleanup(stop)
+		return activity, stop
+	}
+	waitBuild := func(wantPing bool) {
+		t.Helper()
+		deadline := time.NewTimer(120 * time.Second)
+		defer deadline.Stop()
+		started := false
+		for {
+			select {
+			case msg := <-events:
+				ev := msg.BuildEvent
+				if ev == nil {
+					continue
+				}
+				switch {
+				case ev.Started != nil:
+					if started || ev.Started.NixFile != shellNix || ev.Started.Reason.IsPingReceived() != wantPing {
+						t.Fatalf("unexpected Started: %+v", ev.Started)
+					}
+					started = true
+				case ev.Completed != nil:
+					if !started || ev.Completed.NixFile != shellNix {
+						t.Fatalf("unexpected Completed: %+v", ev.Completed)
+					}
+					return
+				case ev.Failure != nil:
+					t.Fatalf("build failed: %s", ev.Failure.Message())
+				}
+			case <-deadline.C:
+				t.Fatal("timed out waiting for build")
+			}
+		}
+	}
+
+	activity, stop := startHandler()
+	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildAlways}
+	waitBuild(true)
+	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildOnlyIfNotYetWatching}
+	select {
+	case msg := <-events:
+		t.Fatalf("already-active watcher emitted an event for conditional ping: %+v", msg.BuildEvent)
+	case <-time.After(time.Second):
+	}
+	// Explicit rebuilds still wake the same active watcher.
+	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildAlways}
+	waitBuild(true)
+	stop()
+
+	// A fresh handler models a daemon restart: the DB registration survives,
+	// but the in-memory watcher map is empty. A conditional ping must resume it.
+	registered, err := db.FindRegisteredProjectForDir(dir)
+	if err != nil || registered == nil {
+		t.Fatalf("missing persisted registration: project=%+v err=%v", registered, err)
+	}
+	activity, stop = startHandler()
+	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildOnlyIfNotYetWatching}
+	waitBuild(true)
+	// The resumed loop must also watch subsequent edits, not just build once.
+	if err := os.WriteFile(shellNix, append(expression, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitBuild(false)
+	stop()
+}
+
 // TestLorriDB exercises the LorriDB wrapper in isolation.
 func TestLorriDB(t *testing.T) {
 	dir := t.TempDir()
