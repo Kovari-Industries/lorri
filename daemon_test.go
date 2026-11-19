@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -146,15 +149,45 @@ derivation {
 // TestDaemonWatchRebuildPolicy exercises the existing handler with real build
 // loops. Requires the same Nix environment as TestDaemonFullStack.
 func TestDaemonWatchRebuildPolicy(t *testing.T) {
+	testDaemonWatchRebuildPolicy(t, false, false)
+}
+
+func TestNativeCachedExportWatchResume(t *testing.T) {
+	for _, overlay := range []bool{false, true} {
+		name := "cached"
+		if overlay {
+			name = "cached-env-file"
+		}
+		t.Run(name, func(t *testing.T) { testDaemonWatchRebuildPolicy(t, true, overlay) })
+	}
+}
+
+func testDaemonWatchRebuildPolicy(t *testing.T, native, overlay bool) {
+	t.Helper()
 	rtc := os.Getenv("RUN_TIME_CLOSURE")
 	if rtc == "" {
 		t.Skip("RUN_TIME_CLOSURE not set — run from lorri nix-shell")
 	}
-	dir := t.TempDir()
+	// Keep Unix socket paths below sockaddr_un's limit even in nix-shell's
+	// temporary directory (t.TempDir includes the long subtest name).
+	dir, err := os.MkdirTemp("", "lorri-watch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Chdir(dir)
+	t.Setenv("LORRI_CACHE_DIR", filepath.Join(dir, "cache"))
+	t.Setenv("LORRI_RUNTIME_DIR", filepath.Join(dir, "socket"))
+	t.Setenv("LORRI_SESSION_ID", "")
+	t.Setenv("LORRI_PROJECT", "")
+	t.Setenv("LORRI_ENV_HASH", "")
+	t.Setenv("LORRI_SHELL_PID", strconv.Itoa(os.Getpid()))
+	t.Setenv("LORRI_SHELL", "bash")
 	shellNix := filepath.Join(dir, "shell.nix")
 	expression := []byte(`
 derivation {
   name = "lorri-watch-policy-test";
+  NATIVE_TEST_MARKER = "initial";
   builder = "/bin/sh";
   args = [ "-c" "echo > $out" ];
   system = builtins.currentSystem;
@@ -165,33 +198,54 @@ derivation {
 	if err := os.WriteFile(shellNix, expression, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	paths := &Paths{
-		GCRootDir:      mustAbsPath(filepath.Join(dir, "gc_roots")),
-		SQLiteDB:       mustAbsPath(filepath.Join(dir, "lorri.sqlite")),
-		LoggedEvalFile: writeLoggedEvalForTest(t, dir),
-	}
-	db, err := OpenLorriDB(paths.SQLiteDB.String())
+	paths, err := InitPaths()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 	project := NewShellNixProjectFile(mustAbsPath(shellNix))
 	events := make(chan LoopHandlerEvent, 64)
 	lorriBin := lorriBinForTest(t)
 
 	startHandler := func() (chan<- IndicateActivity, func()) {
+		db, err := OpenLorriDB(paths.SQLiteDB.String())
+		if err != nil {
+			t.Fatal(err)
+		}
 		activity := make(chan IndicateActivity)
 		done := make(chan struct{})
+		// Exercise the real client handshake and daemon Ping handler, with
+		// the same isolated paths used by native export subprocesses.
+		listener, lock, err := NewSocketPath(paths.DaemonSocketFile).Bind()
+		if err != nil {
+			t.Fatal(err)
+		}
 		go func() {
 			defer close(done)
 			NewDaemon(NixOptions{}).buildInstructionHandler(context.Background(), activity, events, db, paths, rtc, lorriBin)
+		}()
+		connectionsDone := make(chan struct{})
+		go func() {
+			defer close(connectionsDone)
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				NewDaemon(NixOptions{}).handleConn(context.Background(), conn, activity, nil, nil)
+			}
 		}()
 		stopped := false
 		stop := func() {
 			if !stopped {
 				stopped = true
+				listener.Close()
+				<-connectionsDone
+				lock.Release()
 				close(activity)
 				<-done
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
 			}
 		}
 		t.Cleanup(stop)
@@ -229,34 +283,126 @@ derivation {
 		}
 	}
 
+	assertQuiet := func() {
+		t.Helper()
+		select {
+		case msg := <-events:
+			t.Fatalf("already-active watcher emitted an event: %+v", msg.BuildEvent)
+		case <-time.After(time.Second):
+		}
+	}
+	exportSession := func(marker, runtime string) {
+		t.Helper()
+		cmd := exec.Command("bash", "-c", `
+set -eu
+updates=$("$1" export bash)
+eval "$updates"
+test "$NATIVE_TEST_MARKER" = "$2"
+test "${NATIVE_RUNTIME_MARKER-}" = "$3"
+printf '%s\n%s\n%s\n' "$LORRI_SESSION_ID" "$LORRI_PROJECT" "$LORRI_ENV_HASH"
+`, "native-export-test", lorriBin, marker, runtime)
+		cmd.Env = append(os.Environ(), "LORRI_TEST_SUBPROCESS=1")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("native export failed: %v (output %q)", err, out)
+		}
+		values := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(values) != 3 {
+			t.Fatalf("invalid native session: %q", out)
+		}
+		for i, key := range []string{"LORRI_SESSION_ID", "LORRI_PROJECT", "LORRI_ENV_HASH"} {
+			t.Setenv(key, values[i])
+		}
+	}
+	exportUnchanged := func() {
+		t.Helper()
+		cmd := exec.Command(lorriBin, "export", "bash")
+		cmd.Env = append(os.Environ(), "LORRI_TEST_SUBPROCESS=1")
+		if out, err := cmd.CombinedOutput(); err != nil || len(out) != 0 {
+			t.Fatalf("same-hash export: err=%v output=%q", err, out)
+		}
+	}
+	runtime := ""
+	envFile := filepath.Join(dir, "runtime.json")
+	writeOverlay := func(value string) {
+		t.Helper()
+		if err := os.WriteFile(envFile, []byte(`{"version":1,"env":[{"op":"set","name":"NATIVE_RUNTIME_MARKER","value":"`+value+`"}]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	activity, stop := startHandler()
 	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildAlways}
 	waitBuild(true)
 	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildOnlyIfNotYetWatching}
-	select {
-	case msg := <-events:
-		t.Fatalf("already-active watcher emitted an event for conditional ping: %+v", msg.BuildEvent)
-	case <-time.After(time.Second):
-	}
+	assertQuiet()
 	// Explicit rebuilds still wake the same active watcher.
 	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildAlways}
 	waitBuild(true)
+	if native {
+		if overlay {
+			runtime = "one"
+			writeOverlay(runtime)
+			if err := runWatch([]string{"--shell-file", shellNix, "--env-file", envFile}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exportSession("initial", runtime)
+		assertQuiet()
+	}
 	stop()
+
+	if native {
+		// Offline cached loading still works, both on a fresh session and on
+		// the unchanged-session fast path. Nothing may start a daemon here.
+		t.Setenv("LORRI_SESSION_ID", "")
+		exportSession("initial", runtime)
+		exportUnchanged()
+	}
 
 	// A fresh handler models a daemon restart: the DB registration survives,
 	// but the in-memory watcher map is empty. A conditional ping must resume it.
+	db, err := OpenLorriDB(paths.SQLiteDB.String())
+	if err != nil {
+		t.Fatal(err)
+	}
 	registered, err := db.FindRegisteredProjectForDir(dir)
+	db.Close()
 	if err != nil || registered == nil {
 		t.Fatalf("missing persisted registration: project=%+v err=%v", registered, err)
 	}
 	activity, stop = startHandler()
-	activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildOnlyIfNotYetWatching}
+	if native {
+		// The cached environment and session hash still match. This exact
+		// prompt path used to return without resuming the missing watcher.
+		exportUnchanged()
+	} else {
+		activity <- IndicateActivity{ProjectFile: project, Rebuild: RebuildOnlyIfNotYetWatching}
+	}
 	waitBuild(true)
+	if native {
+		for i := 0; i < 3; i++ {
+			exportUnchanged()
+		}
+		assertQuiet()
+		if overlay {
+			runtime = "two"
+			writeOverlay(runtime)
+			exportSession("initial", runtime)
+			exportUnchanged()
+			assertQuiet() // runtime overlay updates do not reevaluate Nix
+		}
+	}
 	// The resumed loop must also watch subsequent edits, not just build once.
-	if err := os.WriteFile(shellNix, append(expression, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(shellNix, []byte(strings.ReplaceAll(string(expression), `"initial"`, `"changed"`)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitBuild(false)
+	if native {
+		exportSession("changed", runtime)
+		exportUnchanged()
+		assertQuiet()
+	}
 	stop()
 }
 

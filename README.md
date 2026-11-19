@@ -34,6 +34,25 @@ registration ensures a daemon-side watcher exists without forcing an environment
 rebuild. This resumes watching after a daemon restart; first registration still
 builds the environment, and actual input changes still trigger rebuilds.
 `lorri internal ping_` remains an explicit forced rebuild request.
+
+Native prompt exports also resume missing watchers when an environment is already
+cached, including on the unchanged-session fast path. This conditional request
+does not reevaluate an active watcher, and an unavailable daemon does not prevent
+cached loading. Runtime `--env-file` updates still reload without rebuilding Nix.
+The protocol and capability string are unchanged; existing clients need updating
+to gain this cached-export correction.
+
+Focused regression checks (Linux, Go 1.26, and the runtime closure from `shell.nix`):
+
+```bash
+CGO_ENABLED=0 go test -count=1 -v \
+  -run '^(TestWatchRebuildPolicy|TestWatchWithoutDaemon|TestWatchResumeCapability|TestDaemonWatchRebuildPolicy|TestNativeCachedExportRebuildPolicy|TestNativeCachedExportWatchResume|TestNativeEnvironmentFileReload)$' .
+```
+
+The real-Nix restart fixture uses only temporary cache, database and socket paths.
+It checks cached loading with the daemon offline, native export after watcher
+restart, repeated-export no-ops, runtime overlays, and subsequent Nix input edits.
+It skips unless `RUN_TIME_CLOSURE` is configured; a skip does not qualify watching.
 The upstream direnv adapter remains available, but Evo uses only the native
 Bash/Zsh hooks.
 

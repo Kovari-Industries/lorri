@@ -168,6 +168,10 @@ func opExport(shellName string) error {
 		if err != nil {
 			return err
 		}
+		// A cached environment survives daemon restarts, but its watcher does not.
+		// Resume it even on the unchanged-session fast path; active watchers do
+		// not reevaluate. An unavailable daemon must not prevent cached loading.
+		_ = opPingWithRebuild(paths, project.ProjectFile(), RebuildOnlyIfNotYetWatching)
 		sum := sha256.Sum256(data)
 		hash := base64.RawURLEncoding.EncodeToString(sum[:])
 		if owned && project.NixFile == os.Getenv("LORRI_PROJECT") && hash == os.Getenv("LORRI_ENV_HASH") {
